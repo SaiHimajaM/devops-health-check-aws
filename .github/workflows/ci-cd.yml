@@ -1,0 +1,73 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run tests
+        run: |
+          python -m pip install --upgrade pip pytest
+          python -m pytest -q tests
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Docker image
+        run: docker build -t health-check-app:${{ github.sha }} .
+      - name: Smoke test container
+        run: |
+          docker run -d --name hc -p 8080:8080 health-check-app:${{ github.sha }}
+          for i in $(seq 1 15); do
+            if curl -fsS http://127.0.0.1:8080/health; then
+              echo "health check passed"; docker rm -f hc; exit 0
+            fi
+            sleep 1
+          done
+          docker logs hc; docker rm -f hc; exit 1
+
+  terraform-validate:
+    needs: test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - run: terraform init -backend=false
+      - run: terraform fmt -check
+      - run: terraform validate
+
+  deploy:
+    # Only deploys when AWS credentials are configured as repository secrets.
+    if: github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
+    needs: [build, terraform-validate]
+    runs-on: ubuntu-latest
+    environment: production
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - run: terraform init
+      - run: terraform apply -auto-approve -var="image_uri=${{ vars.IMAGE_URI }}"
